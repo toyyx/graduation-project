@@ -1,0 +1,957 @@
+import logging
+import math
+import os
+from typing import Tuple
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from PIL import Image
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from tqdm import tqdm
+import json
+from build_sam import sam_model_registry
+from dataset import SingleJSONDataset
+from utils.transforms import ResizeLongestSide
+from torchvision.transforms.functional import gaussian_blur
+import numpy as np
+from typing import Any, Optional, Tuple, Type
+#torch.backends.cudnn.enabled = True
+#torch.backends.cudnn.benchmark = True
+import os
+import shutil
+from datetime import datetime
+
+from PIL import Image
+import time
+import os
+import matplotlib
+
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+def overlay_mask_on_image(image_path, pre_optimization_masks, post_optimization_masks, save_folder='visualize_masks'):
+    # 读取图片
+    image = cv2.imread(image_path)
+    height, width = image.shape[:2]
+
+    if not os.path.exists(save_folder):
+        os.makedirs(save_folder)
+
+    for i, (pre_mask, post_mask) in enumerate(zip(pre_optimization_masks, post_optimization_masks)):
+        if i+1!=16:
+            continue
+        # 确保掩码和图片尺寸一致
+        assert pre_mask.shape == (height, width), f"Pre-optimization Mask {i} shape {pre_mask.shape} does not match image shape ({height}, {width})"
+        assert post_mask.shape == (height, width), f"Post-optimization Mask {i} shape {post_mask.shape} does not match image shape ({height}, {width})"
+
+        def process_mask(mask, prefix):
+            # 为掩码添加颜色通道
+            colored_mask = np.zeros_like(image)
+            colored_mask[mask > 0] = [0, 255, 0]  # 这里将掩码部分设为绿色
+
+            # 将掩码覆盖在图片上
+            alpha = 0.5  # 透明度
+            overlay = cv2.addWeighted(image, 1, colored_mask, alpha, 0)
+
+            # 生成保存路径
+            timestamp = time.time()
+            save_path = os.path.join(save_folder, f"{prefix}_visualization_{timestamp}_{i + 1}.png")
+
+            # 保存图片
+            cv2.imwrite(save_path, overlay)
+
+        # 处理预优化掩码
+        process_mask(pre_mask, "pre_optimization")
+        # 处理后优化掩码
+        process_mask(post_mask, "post_optimization")
+
+
+def visualize_masks_separately(image_path, pre_optimization_mask, post_optimization_mask, save_folder='visualize_masks'):
+    """
+    分别可视化优化前和优化后的掩码在原图上，并保存为图片
+    :param image_path: 原图的路径
+    :param pre_optimization_mask: 优化前的掩码，形状为 (b, h, w)，二值掩码
+    :param post_optimization_mask: 优化后的掩码，形状为 (b, h, w)，二值掩码
+    :param save_folder: 保存图片的文件夹路径
+    """
+    if not os.path.exists(save_folder):
+        os.makedirs(save_folder)
+
+    image = Image.open(image_path)
+    img_width, img_height = image.size
+
+    b, h_mask, w_mask = pre_optimization_mask.shape
+    for i in range(b):
+        if i+1!=16:
+            continue
+        # 可视化优化前的掩码
+        plt.figure(figsize=(10, 10))
+        plt.imshow(image)
+        pre_mask = pre_optimization_mask[i].cpu().numpy()
+        # 假设掩码是要绘制在原图的左上角，你可以根据实际情况调整位置
+        plt.imshow(pre_mask, cmap='gray', alpha=0.5, extent=[0, w_mask, h_mask, 0])
+        plt.title(f'Pre - Optimization Mask {i + 1}')
+        pre_save_path = os.path.join(save_folder, f'pre_optimization_visualization_{time.time()}_{i + 1}.png')
+        plt.savefig(pre_save_path)
+        plt.close()
+        print(f'save pre_optimization_visualization_ to {pre_save_path}')
+
+        # 可视化优化后的掩码
+        plt.figure(figsize=(10, 10))
+        plt.imshow(image)
+        post_mask = post_optimization_mask[i].cpu().numpy()
+        plt.imshow(post_mask, cmap='gray', alpha=0.5, extent=[0, w_mask, h_mask, 0])
+        plt.title(f'Post - Optimization Mask {i + 1}')
+        post_save_path = os.path.join(save_folder, f'post_optimization_visualization_{time.time()}_{i + 1}.png')
+        plt.savefig(post_save_path)
+        plt.close()
+        print(f'save post_optimization_visualization_ to {post_save_path}')
+
+def save_backup_file(file_name, append_str):
+    """
+    保存文件的备份，在原文件名后添加指定后缀和时间信息，并复制到指定目录。
+
+    :param file_name: 要备份的文件名
+    :param append_str: 要添加到文件名的后缀字符串
+    :return: 备份文件的完整路径，如果操作失败则返回 None
+    """
+    backup_dir = "checkpoint_pointRend_python"  # 固定的备份目录
+    try:
+        # 检查文件是否存在
+        if not os.path.exists(file_name):
+            print(f"文件 {file_name} 不存在，无法进行备份。")
+            return None
+
+        # 创建备份目录（如果不存在）
+        if not os.path.exists(backup_dir):
+            os.makedirs(backup_dir)
+
+        # 拆分文件名和扩展名
+        base_name, ext = os.path.splitext(os.path.basename(file_name))
+
+        # 获取当前时间
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # 生成备份文件名
+        backup_name = f"{base_name}_{append_str}_{timestamp}{ext}"
+
+        # 生成备份文件的完整路径
+        backup_path = os.path.join(backup_dir, backup_name)
+
+        # 复制文件
+        shutil.copy2(file_name, backup_path)
+
+        print(f"已成功保存备份文件：{backup_path}")
+        return backup_path
+    except Exception as e:
+        print(f"保存备份文件时出现错误：{e}")
+        return None
+
+class PositionEmbeddingRandom():
+    def __init__(self, num_pos_feats: int = 32, scale: Optional[float] = 1.0) -> None:
+        self.positional_encoding_gaussian_matrix= scale * torch.randn((2, num_pos_feats//2),device='cuda' if torch.cuda.is_available() else 'cpu')# 注册一个缓冲区，用于存储随机生成的高斯矩阵
+                  
+    def _pe_encoding(self,coords: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            # coords (torch.Tensor): 归一化后的坐标张量，形状为 d_1 x ... x d_n x 2
+            """Positionally encode points that are normalized to [0,1]."""  # 对归一化到 [0, 1] 范围内的点进行位置编码
+            # assuming coords are in [0, 1]^2 square and have d_1 x ... x d_n x 2 shape
+            coords = 2 * coords - 1  # 假设输入的坐标在 [0, 1]^2 正方形内，将坐标从 [0, 1] 范围转换到 [-1, 1] 范围
+            coords = coords @ self.positional_encoding_gaussian_matrix  # 将坐标与高斯矩阵相乘，得到新的坐标表示
+            coords = 2 * np.pi * coords  # 将坐标乘以 2π，用于后续的正弦和余弦计算
+            # outputs d_1 x ... x d_n x C shape
+            # 对坐标分别取正弦和余弦值，并在最后一个维度上拼接
+            # 最终输出形状为 d_1 x ... x d_n x C 的位置编码张量
+            return torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1)  # torch.Tensor: 位置编码后的张量，形状为 d_1 x ... x d_n x C
+    
+    def compute_pe_for_sampled_points(self,coords):
+        """
+        为给定的采样点坐标计算位置编码
+        :param coords: 采样点坐标，形状为 (b, n, 2)，格式为 (h, w)
+        :param h: 图像的高度
+        :param w: 图像的宽度
+        :return: 位置编码结果，形状为 (b, n, 2 * num_pos_feats)
+        """
+        with torch.no_grad():
+            if isinstance(coords, torch.Tensor):
+                # 转换坐标顺序 (h, w) 到 (w, h)
+                normalized_coords = torch.stack([coords[..., 1], coords[..., 0]], dim=-1)  # bn2
+
+                return self._pe_encoding(normalized_coords)  # bnd    #nd
+            elif isinstance(coords, list):
+                result = []
+                for coord in coords:
+                    normalized_coord = torch.stack([coord[..., 1], coord[..., 0]], dim=-1)  # n2
+                    result.append(self._pe_encoding(normalized_coord))
+                return result
+
+# torch.distributed.init_process_group(backend="gloo")
+# 设置环境变量，控制多线程计算的线程数
+# os.environ["OMP_NUM_THREADS"] = "4"  # export OMP_NUM_THREADS=4
+# os.environ["OPENBLAS_NUM_THREADS"] = "4"  # export OPENBLAS_NUM_THREADS=4
+# os.environ["MKL_NUM_THREADS"] = "6"  # export MKL_NUM_THREADS=6
+# os.environ["VECLIB_MAXIMUM_THREADS"] = "4"  # export VECLIB_MAXIMUM_THREADS=4
+# os.environ["NUMEXPR_NUM_THREADS"] = "6"  # export NUMEXPR_NUM_THREADS=6
+
+def update_masks(pred_masks, result):
+    B, C, H, W = pred_masks.shape
+    points_idx = result["idx"]
+    rend = result["rend"]
+
+    if isinstance(points_idx, torch.Tensor) and isinstance(rend, torch.Tensor):
+        # 处理 points_idx 为 bn 和 rend 为 b1n 张量的情况
+        points_idx = points_idx.unsqueeze(1).expand(-1, C, -1)
+        pred_masks = (pred_masks.reshape(B, C, -1)
+                      .scatter_(2, points_idx, rend)
+                      .view(B, C, H, W))
+        return pred_masks
+    elif isinstance(points_idx, list) and isinstance(rend, list):
+        # 处理 points_idx 为列表和 rend 为列表的情况
+        new_pred_masks = []
+        for i in range(B):
+            current_points_idx = points_idx[i].unsqueeze(0).expand(C, -1)  # c，<=n
+            current_rend = rend[i]  # 1,<=n
+            current_pred_mask = (pred_masks[i].reshape(C, -1)  # C,H*W
+                                 .scatter_(1, current_points_idx, current_rend)
+                                 .view(C, H, W))
+            new_pred_masks.append(current_pred_mask)
+        new_pred_masks = torch.stack(new_pred_masks, dim=0)
+        return new_pred_masks
+    else:
+        raise ValueError("points_idx 和 rend 必须同时为张量或同时为列表")
+
+
+def calculate_binary_cross_entropy_with_logits(result_rend, gt_points, reduction='mean'):
+    if isinstance(result_rend, torch.Tensor) and isinstance(gt_points, torch.Tensor):
+        # 处理 result_rend 和 gt_points 为张量的情况
+        loss = F.binary_cross_entropy_with_logits(result_rend, (gt_points > 0.0).float(), reduction=reduction)
+        return loss
+    elif isinstance(result_rend, list) and isinstance(gt_points, list):
+        # 处理 result_rend 和 gt_points 为列表的情况
+        total_loss = 0
+        total_elements = 0
+        for rend, gt in zip(result_rend, gt_points):
+            rend = rend.unsqueeze(0)
+            gt = gt.unsqueeze(0)
+            # 这里强制使用 'sum' 来累加每个元素的损失
+            single_loss = F.binary_cross_entropy_with_logits(rend, (gt > 0.0).float(), reduction='sum')
+            total_loss += single_loss
+            # 累加每个元素最后一维的大小
+            total_elements += rend.shape[1]
+        if reduction == 'mean':
+            return total_loss / total_elements
+        elif reduction == 'sum':
+            return total_loss
+        else:
+            raise ValueError("当输入为列表时，reduction 仅支持 'mean' 或 'sum'")
+    else:
+        raise ValueError("result_rend 和 gt_points 必须同时为张量或列表")
+
+
+def init_logger(filename):
+    # 创建第一个日志记录器
+    logger1 = logging.getLogger(filename)
+    logger1.setLevel(logging.INFO)
+
+    # 创建第一个日志记录器的文件处理器
+    file_handler1 = logging.FileHandler(filename)
+    file_handler1.setLevel(logging.INFO)
+
+    # 创建第一个日志记录器的格式化器
+    formatter1 = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler1.setFormatter(formatter1)
+
+    # 将处理器添加到第一个日志记录器
+    logger1.addHandler(file_handler1)
+
+    return logger1
+
+record_logger=init_logger("record.log")
+record_logger.info(f'sam_pointrend')
+
+
+def sort_rbox_points(rbox):
+    """
+    按 top_point、right_point、bottom_point、left_point 的顺序排序 rbox 的点
+    :param rbox: 旋转包围框的四个点坐标
+    :return: 排序后的旋转包围框的四个点坐标
+    """
+    rbox = np.array(rbox)
+    x_values = rbox[:, 0]
+    y_values = rbox[:, 1]
+    # 判断 x 或 y 值是否都不相同
+    if len(set(x_values)) == 4 and len(set(y_values)) == 4:
+        top_point = rbox[np.argmin(rbox[:, 1])]
+        right_point = rbox[np.argmax(rbox[:, 0])]
+        bottom_point = rbox[np.argmax(rbox[:, 1])]
+        left_point = rbox[np.argmin(rbox[:, 0])]
+        return [top_point.tolist(), right_point.tolist(), bottom_point.tolist(), left_point.tolist()]
+    else:
+        # 手动设定矩形
+        min_x = np.min(x_values)
+        max_x = np.max(x_values)
+        min_y = np.min(y_values)
+        max_y = np.max(y_values)
+
+        top_point = [min_x, min_y]
+        right_point = [max_x, min_y]
+        bottom_point = [max_x, max_y]
+        left_point = [min_x, max_y]
+        return [top_point, right_point, bottom_point, left_point]
+
+
+def get_rbox_from_binary_mask(binary_mask, img_width, img_height):
+    # 将 binary_mask 从 Tensor 转换为 numpy 数组
+    binary_mask = binary_mask.cpu().numpy()
+    contours, _ = cv2.findContours(binary_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) == 0:
+        return [[0, 0], [0, 0], [0, 0], [0, 0]]
+    all_points = np.vstack(contours)
+    rect = cv2.minAreaRect(all_points)
+    box = cv2.boxPoints(rect)
+    # 裁剪超出图片范围的点
+    box[:, 0] = np.clip(box[:, 0], 0, img_width)
+    box[:, 1] = np.clip(box[:, 1], 0, img_height)
+    # 排序 rbox 的点
+    sorted_box = sort_rbox_points(box)
+    return sorted_box
+
+
+def calculate_accuracy(pred_mask, gt_mask):
+    pred_mask = pred_mask.bool()
+    gt_mask = gt_mask.bool()
+    batch_size = pred_mask.size(0)
+    batch_accuracies = []
+    for i in range(batch_size):
+        pred_batch = pred_mask[i]
+        gt_batch = gt_mask[i]
+        correct = (pred_batch == gt_batch).sum().item()
+        total = gt_batch.numel()
+        accuracy = correct / total
+        batch_accuracies.append(accuracy)
+    # 计算平均值
+    average_accuracy = sum(batch_accuracies) / len(batch_accuracies)
+    return average_accuracy
+
+
+def calculate_iou(pred_mask, gt_mask):
+    batch_size = pred_mask.size(0)
+    batch_ious = []
+    for i in range(batch_size):
+        pred = pred_mask[i].bool()
+        gt = gt_mask[i].bool()
+        intersection = (pred & gt).sum().item()
+        union = (pred | gt).sum().item()
+        if union == 0:
+            iou = 0
+        else:
+            iou = intersection / union
+        batch_ious.append(iou)
+    average_iou = sum(batch_ious) / len(batch_ious)
+    return average_iou
+
+
+# 定义 Focal Loss
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    """
+        def forward(self, inputs, targets):
+        BCE_loss = nn.BCEWithLogitsLoss(reduction='none')(inputs, targets)
+        pt = torch.exp(-BCE_loss)
+        F_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss
+        return F_loss.mean()
+    """
+
+    def forward(self, inputs, targets):
+        if isinstance(inputs, torch.Tensor): 
+            batch_size = inputs.size(0)
+            batch_losses = []
+            for i in range(batch_size):
+                input_batch = inputs[i].unsqueeze(0)
+                target_batch = targets[i].unsqueeze(0)
+                BCE_loss = nn.BCEWithLogitsLoss(reduction='none')(input_batch, target_batch)
+                pt = torch.exp(-BCE_loss)
+                F_loss_batch = self.alpha * (1 - pt) ** self.gamma * BCE_loss
+                batch_losses.append(F_loss_batch.mean())
+            return torch.stack(batch_losses).mean()
+        else:
+            batch_losses = []
+            for input_batch, target_batch in zip(inputs, targets):
+                input_batch = input_batch.unsqueeze(0)
+                target_batch = (target_batch.unsqueeze(0) > 0.0).float()
+                BCE_loss = nn.BCEWithLogitsLoss(reduction='none')(input_batch, target_batch)
+                pt = torch.exp(-BCE_loss)
+                F_loss_batch = self.alpha * (1 - pt) ** self.gamma * BCE_loss
+                batch_losses.append(F_loss_batch.mean())
+            return sum(batch_losses) / len(batch_losses)
+
+# 定义 Dice Loss
+class DiceLoss(nn.Module):
+    def __init__(self):
+        super(DiceLoss, self).__init__()
+
+    def forward(self, inputs, targets):
+        smooth = 1e-5
+        if isinstance(inputs, torch.Tensor): 
+            inputs = torch.sigmoid(inputs)  # 将输入转换为概率值
+            #inputs = (inputs> 0.0).float()  # 将输入转换为概率值
+            # 对每个样本单独计算交集
+            intersection = (inputs * targets).sum(dim=(1, 2))
+            # 对每个样本单独计算输入和目标的和
+            inputs_sum = inputs.sum(dim=(1, 2))
+            targets_sum = targets.sum(dim=(1, 2))
+            dice = (2. * intersection + smooth) / (inputs_sum + targets_sum + smooth)
+            return 1 - dice.mean()
+        else:
+            result=[]
+            for rend, gt in zip(inputs, targets):
+                rend = rend.unsqueeze(0)
+                gt = (gt.unsqueeze(0) > 0.0).float()
+                rend = torch.sigmoid(rend)  # 将输入转换为概率值
+                 # 对每个样本单独计算交集
+                intersection = (rend * gt).sum(dim=(1, 2))
+                # 对每个样本单独计算输入和目标的和
+                inputs_sum = rend.sum(dim=(1, 2))
+                targets_sum = gt.sum(dim=(1, 2))
+                dice = (2. * intersection + smooth) / (inputs_sum + targets_sum + smooth)
+                result.append(dice.mean())
+            return 1-sum(result) / len(result)
+
+class DBSLoss(nn.Module):
+    def __init__(self, sigma=5, smooth=1e-5):
+        super(DBSLoss, self).__init__()
+        self.sigma = sigma
+        self.smooth = smooth
+
+    def _generate_weights(self, mask):
+        # 扩展维度以适应卷积操作
+        mask = mask.unsqueeze(1)
+        # 定义边缘检测卷积核
+        kernel = torch.tensor([[[
+            [-1, -1, -1],
+            [-1, 8, -1],
+            [-1, -1, -1]
+        ]]], dtype=torch.float32).to(mask.device)
+
+        # 进行卷积操作
+        boundary = F.conv2d(mask, kernel, padding=1)
+
+        # 二值化处理得到边界掩码
+        boundary_mask = (boundary > 0).float()
+
+        # 高斯模糊生成权重图（边界附近权重更高）
+        # 计算高斯核的大小，确保覆盖 3σ 范围
+        kernel_size = int(self.sigma * 4 + 1)
+        # 调用 gaussian_blur 函数对边界图进行高斯模糊处理
+        weight_map = gaussian_blur(
+            boundary_mask,
+            kernel_size=kernel_size,
+            sigma=self.sigma
+        )  # (N, 1, H, W)
+
+        # 归一化到 [0, 1] 并去除通道维度
+        # 找到每个样本的最大权重值，先在高度方向上取最大值，再在宽度方向上取最大值
+        max_values = weight_map.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0]
+        # 为了避免除零错误，加上一个很小的数 1e-6
+        weight_map = weight_map / (max_values + 1e-6) + 1.0
+        # 去除通道维度，得到 (N, H, W) 形状的权重图
+        return weight_map.squeeze(1)  # (N, H, W)
+
+    def forward(self, inputs, targets):
+        smooth = self.smooth
+        inputs = torch.sigmoid(inputs)  # 将输入转换为概率值
+
+        # 生成边界权重图
+        weights = self._generate_weights(targets)  # (N, H, W)
+
+        # 对每个样本单独计算加权交集
+        intersection = (inputs * targets * weights).sum(dim=(1, 2))
+        # 对每个样本单独计算加权输入和目标的和
+        inputs_sum = (inputs * weights).sum(dim=(1, 2))
+        targets_sum = (targets * weights).sum(dim=(1, 2))
+
+        dice = (2. * intersection + smooth) / (inputs_sum + targets_sum + smooth)
+        return 1 - dice.mean()
+
+
+def init_model(checkpoint_path=None):
+    model_type = "vit_b"
+    sam_checkpoint_path = "sam_vit_b_01ec64.pth"
+
+    # 加载SAM模型
+    sam = sam_model_registry[model_type]()
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    sam.to(device)
+
+    if checkpoint_path is None:
+        checkpoint = torch.load(sam_checkpoint_path, map_location=device)
+
+        log = sam.load_state_dict(checkpoint, strict=False)
+
+        print("Model loaded from {} \n => {}".format(sam_checkpoint_path, log))
+    else:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        log = sam.load_state_dict(checkpoint, strict=False)
+
+        print("Model loaded from {} \n => {}".format(checkpoint_path, log))
+
+    # 冻结原有参数no_mask_embed
+    for name, param in sam.named_parameters():
+        param.requires_grad = False
+
+    #total_trainable_params = 0
+    #for name, param in sam.named_parameters():
+        # param.requires_grad = True
+        #print(f"可训练参数名: {name} {param.numel()}")
+        #total_trainable_params += param.numel()
+
+    #print(f"可训练参数量: {total_trainable_params}")
+
+    return sam
+
+
+from pointrend_test import PointRend, PointHead, point_sample, StandardPointHead, PointHead_try, PointRend_try, point_sample_by_idx
+
+
+def init_pointrend(checkpoint_path=None):
+    pointRend = PointRend_try(head=StandardPointHead(), training=True)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    pointRend.to(device)
+
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        log = pointRend.load_state_dict(checkpoint, strict=False)
+
+        print("Model loaded from {} \n => {}".format(checkpoint_path, log))
+
+    total_trainable_params = 0
+    for name, param in pointRend.named_parameters():
+        param.requires_grad = True
+        print(f"可训练参数名: {name} {param.numel()}")
+        total_trainable_params += param.numel()
+    print(f"可训练参数量: {total_trainable_params}")
+    
+    num_params = sum(p.numel() for p in pointRend.parameters())
+    print(f"模型参数量: {num_params}")
+    record_logger.info(f'模型参数量: {num_params}')
+
+    return pointRend
+
+
+import cv2
+
+
+# def process_single(sam, image_file_path, rbox_tensor):
+def process_single(sam, image_file_path, bbox_tensor, rbox_tensor):
+    def xywh_to_xyxy(boxes):
+        """
+        将 xywh 格式的边界框转换为 xyxy 格式
+        :param boxes: 形状为 (N, 4) 的张量，N 是边界框数量，每个边界框是 [x, y, w, h] 格式
+        :return: 形状为 (N, 4) 的张量，每个边界框是 [x1, y1, x2, y2] 格式
+        """
+        x = boxes[:, 0]
+        y = boxes[:, 1]
+        w = boxes[:, 2]
+        h = boxes[:, 3]
+        x1 = x
+        y1 = y
+        x2 = x + w
+        y2 = y + h
+        return torch.stack([x1, y1, x2, y2], dim=1)
+
+    transform = ResizeLongestSide(sam.image_encoder.img_size)  # 创建一个 ResizeLongestSide 实例，用于将图像的最长边调整为模型期望的尺寸
+    # 读取图像
+    image = cv2.imread(image_file_path)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    assert "RGB" in [  # 检查图像格式是否为 'RGB' 或 'BGR'，如果不是则抛出异常
+        "RGB",
+        "BGR",
+    ], f"image_format must be in ['RGB', 'BGR'], is RGB."
+    if "RGB" != "RGB":  # 如果图像格式与模型期望的格式不一致，则反转通道顺序
+        image = image[..., ::-1]
+
+    input_image = transform.apply_image(image)  # 应用 ResizeLongestSide 变换，将图像的最长边调整为模型期望的尺寸
+    input_image_torch = torch.as_tensor(input_image, device=sam.device)  # 将 NumPy 数组转换为 PyTorch 张量，并将其放置在与模型相同的设备上
+    input_image_torch = input_image_torch.permute(2, 0, 1).contiguous()[None, :, :,
+                        :]  # 调整张量的维度顺序为 BCHW（批次、通道、高度、宽度），并确保内存连续
+
+    original_size = image.shape[:2]  # 保存原始图像的尺寸
+    input_size = tuple(input_image_torch.shape[-2:])  # 保存输入图像（变换后）的尺寸
+    input_image = sam.preprocess(input_image_torch)  # 对输入图像进行预处理，如归一化、填充等操作
+    image_embeddings = sam.image_encoder(input_image)
+
+    # bbox_tensor =xywh_to_xyxy(bbox_tensor)
+    bbox_tensor = torch.tensor(transform.apply_boxes(bbox_tensor.numpy(), original_size),
+                               device=sam.device)  # 对输入的点坐标进行变换，使其与模型输入的图像尺寸匹配
+    rbox_tensor = torch.tensor(transform.apply_rboxes(rbox_tensor.numpy(), original_size),
+                               device=sam.device)  # 对输入的点坐标进行变换，使其与模型输入的图像尺寸匹配
+
+    sparse_embeddings, dense_embeddings = sam.prompt_encoder(
+        points=None,
+        # boxes=None,
+        boxes=bbox_tensor,
+        rboxes=None,
+        rboxes_origin=rbox_tensor,
+        masks=None
+    )
+    low_res_masks, iou_predictions = sam.mask_decoder(
+        image_embeddings=image_embeddings,
+        image_pe=sam.prompt_encoder.get_dense_pe(),
+        sparse_prompt_embeddings=sparse_embeddings,
+        dense_prompt_embeddings=dense_embeddings,
+        multimask_output=False  ##
+    )
+    masks = sam.postprocess_masks(  # 对低分辨率掩码进行后处理，将其调整到输入图像的原始尺寸
+        low_res_masks,
+        input_size=input_size,  ##
+        original_size=original_size,
+    )
+
+    return masks
+
+
+def process_single_image(sam, image_file_path):
+    transform = ResizeLongestSide(sam.image_encoder.img_size)  # 创建一个 ResizeLongestSide 实例，用于将图像的最长边调整为模型期望的尺寸
+    # 读取图像
+    image = cv2.imread(image_file_path)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    assert "RGB" in [  # 检查图像格式是否为 'RGB' 或 'BGR'，如果不是则抛出异常
+        "RGB",
+        "BGR",
+    ], f"image_format must be in ['RGB', 'BGR'], is RGB."
+    if "RGB" != "RGB":  # 如果图像格式与模型期望的格式不一致，则反转通道顺序
+        image = image[..., ::-1]
+
+    input_image, target_size = transform.apply_image_return_target_size(
+        image)  # 应用 ResizeLongestSide 变换，将图像的最长边调整为模型期望的尺寸
+    input_image_torch = torch.as_tensor(input_image, device=sam.device)  # 将 NumPy 数组转换为 PyTorch 张量，并将其放置在与模型相同的设备上
+    input_image_torch = input_image_torch.permute(2, 0, 1).contiguous()[None, :, :,
+                        :]  # 调整张量的维度顺序为 BCHW（批次、通道、高度、宽度），并确保内存连续
+
+    original_size = image.shape[:2]  # 保存原始图像的尺寸
+    input_size = tuple(input_image_torch.shape[-2:])  # 保存输入图像（变换后）的尺寸
+    input_image = sam.preprocess(input_image_torch)  # 对输入图像进行预处理，如归一化、填充等操作
+    image_embeddings = sam.image_encoder(input_image)
+
+    return image_embeddings, input_size, original_size, target_size
+
+
+def process_single_mask(sam, image_embeddings, input_size, original_size, bbox_tensor, rbox_tensor):
+    def xywh_to_xyxy(boxes):
+        """
+        将 xywh 格式的边界框转换为 xyxy 格式
+        :param boxes: 形状为 (N, 4) 的张量，N 是边界框数量，每个边界框是 [x, y, w, h] 格式
+        :return: 形状为 (N, 4) 的张量，每个边界框是 [x1, y1, x2, y2] 格式
+        """
+        x = boxes[:, 0]
+        y = boxes[:, 1]
+        w = boxes[:, 2]
+        h = boxes[:, 3]
+        x1 = x
+        y1 = y
+        x2 = x + w
+        y2 = y + h
+        return torch.stack([x1, y1, x2, y2], dim=1)
+
+    transform = ResizeLongestSide(sam.image_encoder.img_size)  # 创建一个 ResizeLongestSide 实例，用于将图像的最长边调整为模型期望的尺寸
+    bbox_tensor = xywh_to_xyxy(bbox_tensor)
+    bbox_tensor = torch.tensor(transform.apply_boxes(bbox_tensor.numpy(), original_size),
+                               device=sam.device)  # 对输入的点坐标进行变换，使其与模型输入的图像尺寸匹配
+    rbox_tensor = torch.tensor(transform.apply_rboxes(rbox_tensor.numpy(), original_size),
+                               device=sam.device)  # 对输入的点坐标进行变换，使其与模型输入的图像尺寸匹配
+
+    sparse_embeddings, dense_embeddings = sam.prompt_encoder(
+        points=None,
+        boxes=bbox_tensor,
+        # boxes=bbox_tensor,
+        boxes_origin=None,
+        rboxes=rbox_tensor,
+        rboxes_origin=None,
+        masks=None
+    )
+    low_res_masks, iou_predictions = sam.mask_decoder(
+        image_embeddings=image_embeddings,
+        image_pe=sam.prompt_encoder.get_dense_pe(),
+        sparse_prompt_embeddings=sparse_embeddings,
+        dense_prompt_embeddings=dense_embeddings,
+        multimask_output=False  ##
+    )
+
+    # masks = sam.postprocess_masks(  # 对低分辨率掩码进行后处理，将其调整到输入图像的原始尺寸
+    # low_res_masks,
+    # input_size=input_size,  ##
+    # original_size=original_size,
+    # )
+
+    return low_res_masks#, src
+
+def update_logit_by_rend(original,result_rend):
+    # 将 original 转换为 0 或 1
+    original_binary = (original > 0.0).float()
+
+    # 将 result_rend 转换为 0 或 1
+    result_rend_binary = (result_rend > 0.0).float()
+
+    # 找到二值化后不同的元素的掩码
+    diff_mask = (original_binary != result_rend_binary).squeeze()
+    # 将 original 内的这些元素取负值
+    original[diff_mask] = -original[diff_mask]
+    return original
+
+from dataset import SingleJSONDataset_with_rbox
+
+
+def evaluate(batch_size, save_Path):
+    training_logger = init_logger("training_sa1b_pointrend_2.log")
+    train_avg_logger = init_logger("train_avg_sa1b_pointrend.log")
+    val_avg_logger = init_logger("val_avg_sa1b_pointrend.log")
+    test_avg_logger = init_logger("test_avg_sa1b_pointrend.log")
+    # logging.basicConfig(filename='training_sa1b_pointrend.log', level=logging.INFO,format='%(asctime)s - %(levelname)s - %(message)s')
+    checkpoint_path = r'./checkpoint_new/sam_conbine_epoch_88_5lr5.pth'  ##
+    # checkpoint_path=None
+    sam = init_model(checkpoint_path)
+    sam.eval()
+    pointRend_checkpoint_path='./checkpoint_pointRend/pointRend_sam_epoch_3_lr4_origin_ConvTranspose2d_32_predicter_Linear124_2dim_norm_dropout2.pth'
+    #pointRend_checkpoint_path = None
+    pointRend = init_pointrend(pointRend_checkpoint_path)
+    pos_random=PositionEmbeddingRandom(64)
+
+    # 定义优化器，只优化可训练的参数
+    dice_loss = DiceLoss()
+    focal_loss = FocalLoss()
+    save_dir = save_Path
+    best_iou = 0
+    best_loss = 1000
+    best_epoch = 0
+
+
+    val_dataset_folder_path = r'/root/autodl-tmp/SA-1B/val-un100'
+    val_image_files = [f for f in os.listdir(val_dataset_folder_path) if f.endswith('.jpg')]
+    num_val = 100
+    
+
+    # 划分数据集
+    val_image_files = val_image_files[:num_val]
+
+    print('start reading json......')
+    # 存储所有 JSON 文件的数据
+    val_jsondata = []
+    # 一次性读取所有 JSON 文件
+    for image_filename in val_image_files:
+        json_filename = os.path.splitext(image_filename)[0] + '.json'
+        json_file_path = os.path.join(val_dataset_folder_path, json_filename)
+        # 检查对应的JSON文件是否存在
+        if os.path.exists(json_file_path):
+            try:
+                with open(json_file_path, 'r') as f:
+                    data = json.load(f)
+                    val_jsondata.append(data)
+            except json.JSONDecodeError:
+                print(f"JSON 解析错误: {json_file_path}")
+            except Exception as e:
+                print(f"读取文件 {json_file_path} 时出错: {e}")
+
+    print('finish reading json')
+
+
+    # 验证阶段
+    pointRend.eval()
+    total_val_loss = 0
+    total_val_loss_origin = 0
+    total_val_dice_origin = 0
+    total_val_focal_origin = 0
+    total_iou = 0
+    total_num = 0
+
+    #total_time=0
+    total_mflops=0
+    total_sample_num=0
+
+    with torch.no_grad():
+        for image_index, (image_filename, data) in tqdm(enumerate(zip(val_image_files, val_jsondata), start=1),total=len(val_image_files),desc=f'Val ==> '):
+
+            dataset = SingleJSONDataset_with_rbox(data)
+            dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=True)
+            total_num += len(dataloader)
+            image_file_path = os.path.join(val_dataset_folder_path, image_filename)
+            image_embeddings = None
+            for batch_idx, (bbox_tensor, rbox_tensor, gt_mask_tensor) in enumerate(dataloader,start=1):  # point_tensor:b12    gt_mask_tensor:bhw
+                gt_mask_tensor = gt_mask_tensor.to(sam.device)
+
+                #start_time = time.time()
+
+                #if image_embeddings is None:
+                #start_time_temp = time.time()
+                #"""
+                with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                    profile_memory=True,
+                    record_shapes=True,
+                    with_flops=True
+                ) as prof:
+                #"""
+                
+                    image_embeddings, input_size, original_size, target_size = process_single_image(sam,image_file_path)
+                    low_res_masks = process_single_mask(sam, image_embeddings, input_size, original_size, bbox_tensor,rbox_tensor)
+                    #end_time_temp = time.time()
+                    #print(f'record 1 :{end_time_temp-start_time_temp}')
+
+                    # 1024
+                    #start_time_temp = time.time()
+                    pred_masks_1024 = F.interpolate(low_res_masks,(sam.image_encoder.img_size, sam.image_encoder.img_size),mode="bilinear", align_corners=False, )  # b 1 1024 1024
+                    pred_masks_1024 = pred_masks_1024[..., : input_size[0], : input_size[1]].contiguous()
+                    #end_time_temp = time.time()
+                    #print(f'record 2 :{end_time_temp-start_time_temp}')
+
+                    #start_time_temp = time.time()
+                    result_1024 = pointRend.forward_eval(image_embeddings, pred_masks_1024, input_size[0], input_size[1],pos_random)
+                    #end_time_temp = time.time()
+                    #print(f'record 3 :{end_time_temp-start_time_temp}')
+
+                    #start_time_temp = time.time()
+                    ####################
+                    # 获取原始mask的logits
+                    B, C, H, W = pred_masks_1024.shape
+                    flat_mask = pred_masks_1024.view(B, -1)  # [B, H*W]
+                    result_rend_1024 = []
+                    for i in range(B):
+                        original = torch.gather(
+                            flat_mask[i],
+                            dim=0,
+                            index=result_1024["idx"][i]
+                        ).unsqueeze(-1)  # [N,1]
+                        original = update_logit_by_rend(original,result_1024["rend"][i])  # <=n,1
+                        result_rend_1024.append(original)  # list <=n,1
+
+                        # 替换 pred_masks_1024 中对应位置的值
+                        flat_mask[i].scatter_(dim=0, index=result_1024["idx"][i], src=original.squeeze(-1))
+                    #####################
+
+                    pred_masks_1024 = flat_mask.view(B, C, H, W)
+
+                    #end_time_temp = time.time()
+                    #print(f'record 4 :{end_time_temp-start_time_temp}')
+
+                    #start_time_temp = time.time()
+                    # origin
+                    pred_masks_origin = F.interpolate(pred_masks_1024, original_size, mode="bilinear",align_corners=False)
+                    #record_pre_mask=pred_masks_origin.clone()
+                    result_origin = pointRend.forward_eval(image_embeddings, pred_masks_origin, input_size[0], input_size[1],pos_random)
+                    #end_time_temp = time.time()
+                    #print(f'record 5 :{end_time_temp-start_time_temp}')
+
+                    #start_time_temp = time.time()
+                    ####################
+                    # 获取原始mask的logits
+                    B, C, H, W = pred_masks_origin.shape
+                    flat_mask = pred_masks_origin.view(B, -1)  # [B, H*W]
+                    result_rend_origin = []
+                    for i in range(B):
+                        original = torch.gather(
+                            flat_mask[i],
+                            dim=0,
+                            index=result_origin["idx"][i]
+                        ).unsqueeze(-1)  # [N,1]
+
+                        original = update_logit_by_rend(original,result_origin["rend"][i])
+
+                        result_rend_origin.append(original)  # list <=n,1
+                        # 替换 pred_masks_origin 中对应位置的值
+                        flat_mask[i].scatter_(dim=0, index=result_origin["idx"][i], src=original.squeeze(-1))
+                    #####################
+                    pred_masks_origin = flat_mask.view(B, C, H, W)
+                    #end_time_temp = time.time()
+                    #print(f'record 6 :{end_time_temp-start_time_temp}')
+
+                #end_time = time.time()
+                #inference_time = end_time - start_time
+                #total_time+=inference_time
+
+                #total_sample_num+=pred_masks_origin.shape[0]
+                total_sample_num+=1
+                
+                #"""
+                # 获取所有操作的平均事件
+                events = prof.key_averages()
+                # 对所有操作的 FLOPs 进行求和
+                flops = sum(event.flops for event in events)
+                # 将总 FLOPs 转换为 MFLOPs
+                mflops = flops / 1e9
+                total_mflops+=mflops
+                #"""
+                
+
+
+
+                gt_points_origin = point_sample_by_idx(gt_mask_tensor, result_origin["idx"])  # list <=n,c
+
+                #overlay_mask_on_image(image_file_path,(record_pre_mask.squeeze(1)>0.0).float().cpu(),(pred_masks_origin.squeeze(1)>0.0).float().cpu())
+
+                # 计算二元交叉熵损失
+                loss_origin = calculate_binary_cross_entropy_with_logits(result_rend_origin, gt_points_origin)
+                dice_origin = dice_loss(pred_masks_origin.squeeze(1) , (gt_mask_tensor > 0.0).float())
+
+                focal_origin = focal_loss(result_rend_origin , gt_points_origin)  
+
+                loss =loss_origin
+                total_val_loss += loss.item()
+
+                total_val_loss_origin += loss_origin
+
+                total_val_dice_origin += dice_origin
+
+                total_val_focal_origin += focal_origin
+
+
+                iou = calculate_iou(pred_masks_origin.squeeze(1) > 0.0, gt_mask_tensor)
+                total_iou += iou
+
+                # 释放不必要的中间变量
+
+                #del pred_masks_origin, result_origin, result_rend_origin, gt_points_origin
+                torch.cuda.empty_cache()
+
+                print(f'VAL ==> file:{image_index}/{num_val}  batch:{batch_idx}/{len(dataloader)}, loss_origin: {loss_origin}, dice_origin: {dice_origin}, focal_origin: {focal_origin},  final_loss:{loss}, iou:{iou}')
+                training_logger.info(f'VAL ==> file:{image_index}/{num_val}  batch:{batch_idx}/{len(dataloader)}, loss_origin: {loss_origin}, dice_origin: {dice_origin}, focal_origin: {focal_origin},  final_loss:{loss}, iou:{iou}')
+                #print(f'VAL ==> time: {inference_time}, num: {pred_masks_origin.shape[0]}')
+                print(f'VAL ==> mflops: {mflops}, num: {pred_masks_origin.shape[0]}')
+                
+
+    avg_val_loss = total_val_loss / total_num
+
+    avg_val_loss_origin = total_val_loss_origin / total_num
+    avg_iou = total_iou / total_num
+
+    avg_val_dice_origin = total_val_dice_origin / total_num if total_num > 0 else 0
+
+    avg_val_focal_origin = total_val_focal_origin / total_num if total_num > 0 else 0
+
+    #avg_time=total_time / total_sample_num
+    #avg_fps=1 / avg_time
+    avg_mflops=total_mflops / total_sample_num
+
+
+    print(f'VAL ==> val Loss_origin: {avg_val_loss_origin},Train avg_val_dice_origin: {avg_val_dice_origin},Train avg_val_focal_origin: {avg_val_focal_origin}, val Loss: {avg_val_loss} IoU: {avg_iou}')
+    val_avg_logger.info(f'VAL ==> val Loss_origin: {avg_val_loss_origin},Train avg_val_dice_origin: {avg_val_dice_origin},Train avg_val_focal_origin: {avg_val_focal_origin}, val Loss: {avg_val_loss} IoU: {avg_iou}')
+
+    #print(f'VAL ==> total time: {total_time}, total num: {total_sample_num}, avg time: {avg_time}, avg_fps: {avg_fps}')
+    #record_logger.info(f'VAL ==> total time: {total_time}, total num: {total_sample_num}, avg time: {avg_time}, avg_fps: {avg_fps}')
+    print(f'VAL ==> total mflops: {total_mflops}, total num: {total_sample_num}, avg_mflops: {avg_mflops}')
+    record_logger.info(f'VAL ==> total mflops: {total_mflops}, total num: {total_sample_num}, avg_mflops: {avg_mflops}')
+        
+
+
+# 获取当前脚本文件所在的目录
+current_dir = os.path.dirname(os.path.abspath(__file__))
+save_Path = os.path.join(current_dir, "checkpoint_pointRend")
+evaluate(1, save_Path)
+
