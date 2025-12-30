@@ -1,0 +1,98 @@
+version: v2.0
+
+name: release_autoregion
+
+on:
+  tag:
+    tags: [ ver_* ]
+    # from-branches: [master]
+
+stages:
+  - name: build
+    jobs:
+      build_windows:
+        runs-on: windows-2016
+        env:
+          PYTHON: C:\Users\Administrator\AppData\Local\Programs\Python\Python310\python.exe
+          SETUP_ENV: ${{ ci.workspace }}/setup_env/
+          PYTHONPATH: ${{ ci.workspace }}/setup_env/Lib/site-packages/
+        steps:
+          - checkout: self
+            with:
+              strategy: FRESH_CHECKOUT
+          - run: |
+              Get-ChildItem dist | Remove-Item 
+              &$env:PYTHON -m pip install -U pip setuptools wheel -i https://mirrors.tencent.com/pypi/simple
+              &$env:PYTHON setup.py build bdist_wheel
+              &$env:PYTHON -m pip install ("dist/" + (Get-ChildItem dist/*.whl | select -First 1).Name) PyInstaller --prefix $env:SETUP_ENV -i https://mirrors.tencent.com/pypi/simple
+              &$env:PYTHON -m PyInstaller labelme.spec
+            shell: powershell
+          - run: |
+              $tag = $env:GIT_REF -replace $env:TAG_REPLACE_PAT, $env:GIT_SHA_SHORT
+              $tag = $tag.replace("\", "/").split("/")[-1]
+              Write-Host ('workspace is ' + '${{ ci.workspace }}')
+              Write-Host ('tag is ' + $tag)
+              Write-Host ('username is ' + $env:USERNAME)
+              $uri = "https://mirrors.tencent.com/repository/generic/autoregion/autoregion-labelme-" + $tag + ".exe"
+              $headers = @{
+                Authorization = "Basic " + [convert]::ToBase64String([text.encoding]::ASCII.GetBytes(
+                  $env:USERNAME + ":" + $env:PASSWORD
+                ))
+              }
+              $body = [io.file]::ReadAllBytes( (Get-ChildItem dist/labelme.exe | select -First 1).FullName  )
+              $res = Invoke-RestMethod -Uri $uri -Method Put -Headers $headers -Body $body -ContentType "application/octet-stream"
+              $exitcode = $LASTEXITCODE
+              Write-Host $res
+              Get-ChildItem dist/labelme.exe | Get-FileHash -Algorithm MD5 | ForEach-Object { $_.Hash.ToLower() + " " + $_.Path } | Write-Host 
+              exit $exitcode
+            shell: powershell
+            env:
+              USERNAME: ${{ settings.mirrors_autoregion_dist.username }}
+              PASSWORD: ${{ settings.mirrors_autoregion_dist.password }}
+              GIT_REF: ${{ ci.ref }}
+              GIT_SHA_SHORT: ${{ ci.sha_short }}
+              TAG_REPLACE_PAT: \$.*$
+      build_macos:
+        runs-on: macos-12.4
+        env:
+          SETUP_ENV: ${{ ci.workspace }}/setup_env/
+        steps:
+          - run: |
+              pyenv install 3.9.13
+              pyenv global 3.9.13
+            shell: bash
+            env:
+              PYTHON_CONFIGURE_OPTS: "--enable-framework"
+          - checkout: self
+            with:
+              strategy: FRESH_CHECKOUT
+          - run: |
+              ls dist/* | xargs -n 1 rm
+              python3 -m pip install -U pip setuptools wheel -i https://mirrors.tencent.com/pypi/simple
+              python3 setup.py build bdist_wheel
+              python3 -m pip install `ls dist/*.whl | head -1` PyInstaller --prefix "${SETUP_ENV}" -i https://mirrors.tencent.com/pypi/simple
+              export PYTHONPATH=$(find "${SETUP_ENV}" -type d | grep site-packages$)
+              echo ${SETUP_ENV}
+              echo ${PYTHONPATH}
+              python3 -c "import sys; print(sys.path)"
+              python3 -m PyInstaller labelme.spec
+            shell: bash
+          - run: |
+              echo ${TAG_REPLACE_PAT}
+              tag=$(echo "${GIT_REF}" | sed -E "s/${TAG_REPLACE_PAT}/${GIT_SHA_SHORT}/g")
+              tag=$(basename $(echo "${tag}" | sed 's!\\!/!g'))
+              echo "workspace is" "${{ ci.workspace }}"
+              echo "tag is" ${tag}
+              echo "username is" ${USERNAME}
+              uri="https://mirrors.tencent.com/repository/generic/autoregion/autoregion-labelme-${tag}"
+              curl --request PUT -u ${USERNAME}:${PASSWORD} --url ${uri} --upload-file dist/labelme
+              exitcode=$?
+              md5 dist/labelme
+              exit ${exitcode}
+            shell: bash
+            env:
+              USERNAME: ${{ settings.mirrors_autoregion_dist.username }}
+              PASSWORD: ${{ settings.mirrors_autoregion_dist.password }}
+              GIT_REF: ${{ ci.ref }}
+              GIT_SHA_SHORT: ${{ ci.sha_short }}
+              TAG_REPLACE_PAT: \\$.*$
