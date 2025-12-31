@@ -1,16 +1,16 @@
 *.pyc
 # Project specific
 *.DS_Store
-*.pth
-*.nii.gz
-*.nii
-*.npy
-*.npz
-*.csv
-*.log
-*.png
+#*.pth
+#*.nii.gz
+#*.nii
+#*.npy
+#*.npz
+#*.csv
+#*.log
+#*.png
 data/
-work_dir/
+#work_dir/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -90,7 +90,7 @@ docs/_build/
 target/
 
 # Jupyter Notebook
-.ipynb_checkpoints
+#.ipynb_checkpoints
 
 # IPython
 profile_default/
